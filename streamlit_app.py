@@ -5,7 +5,6 @@ import time
 import urllib.parse
 import requests
 from bs4 import BeautifulSoup
-
 # -------------------
 # Original constants
 # -------------------
