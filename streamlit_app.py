@@ -5,8 +5,9 @@ import time
 import urllib.parse
 import requests
 from bs4 import BeautifulSoup
+
 # -------------------
-# Original constants
+# Constants
 # -------------------
 BASE_URL = "https://va.mite.gov.it"
 DOWNLOAD_FOLDER = "downloads"
@@ -42,11 +43,9 @@ def find_total_pages(soup) -> int:
         return int(match.group(2))
     return 1
 
-# ---------------------------------------
-# Step 1: Collect search results (paged)
-# ---------------------------------------
-@st.cache_data  # Cache so repeated searches with the same args are faster
+@st.cache_data  # caches results for the same keyword & search_type
 def collect_search_results(keyword: str, search_type="o"):
+    """ Gather all detail page URLs across paginated search results. """
     all_links = []
     page = 1
 
@@ -74,7 +73,6 @@ def collect_search_results(keyword: str, search_type="o"):
                 all_links.append(full_url)
 
         total_pages = find_total_pages(soup)
-
         if page >= total_pages:
             break
 
@@ -84,15 +82,14 @@ def collect_search_results(keyword: str, search_type="o"):
     return all_links
 
 def get_project_id(detail_url: str) -> str:
+    """ Extract a numeric ID from URLs like /Info/1234 or /Documentazione/5678. """
     match = re.search(r'(?:Info|Documentazione)/(\d+)', detail_url)
     if match:
         return match.group(1)
     return "UnknownProject"
 
-# ---------------------------------------------------------
-# Step 2: From a detail page, get the links to procedures
-# ---------------------------------------------------------
-def get_procedura_links(detail_url: str, search_type: str):
+def get_procedura_links(detail_url: str):
+    """ From a detail page, gather any /it-IT/Oggetti/Documentazione/... procedure links. """
     try:
         resp = requests.get(detail_url, timeout=10)
         resp.raise_for_status()
@@ -114,10 +111,11 @@ def get_procedura_links(detail_url: str, search_type: str):
 
     return procedura_links
 
-# ------------------------------------------------
-# Step 3: Inside a procedure, find document links
-# ------------------------------------------------
 def get_document_links(procedura_url: str):
+    """ 
+    Inside a procedure page, find table(class="Documentazione") rows 
+    and extract (download_url, nome_file).
+    """
     try:
         resp = requests.get(procedura_url, timeout=10)
         resp.raise_for_status()
@@ -131,14 +129,14 @@ def get_document_links(procedura_url: str):
         return []
 
     doc_links = []
-    rows = table.find_all("tr")[1:]  # skip header
+    rows = table.find_all("tr")[1:]  # skip header row
     for row in rows:
         cols = row.find_all("td")
         if len(cols) < 9:
             continue
 
-        nome_file = cols[1].get_text(strip=True)
-        download_td = cols[8]
+        nome_file = cols[1].get_text(strip=True)  # second column
+        download_td = cols[8]                     # ninth column
         download_a = download_td.find("a", href=True, title="Scarica il documento")
         if not download_a:
             continue
@@ -149,18 +147,20 @@ def get_document_links(procedura_url: str):
 
     return doc_links
 
-# ---------------------------------------------
-# Step 4: Optionally download the file locally
-# ---------------------------------------------
 def download_file(url: str, nome_file: str, save_path: str):
+    """ 
+    Download the file from `url`, save it as `nome_file` in `save_path`. 
+    Filenames are sanitized.
+    """
+    safe_filename = re.sub(r'[\\/*?:"<>|]', "_", nome_file)
+    local_path = os.path.join(save_path, safe_filename)
+
+    if os.path.exists(local_path):
+        st.info(f"File '{safe_filename}' already exists. Skipping.")
+        return
+
     try:
-        safe_filename = re.sub(r'[\\/*?:"<>|]', "_", nome_file)
-        local_path = os.path.join(save_path, safe_filename)
-
-        if os.path.exists(local_path):
-            st.info(f"File '{safe_filename}' already exists. Skipping.")
-            return
-
+        st.write(f"Downloading: {url}")
         with requests.get(url, stream=True, timeout=20) as r:
             r.raise_for_status()
             with open(local_path, "wb") as f:
@@ -169,75 +169,94 @@ def download_file(url: str, nome_file: str, save_path: str):
                         f.write(chunk)
 
         st.success(f"Saved => {local_path}")
-
     except Exception as e:
         st.error(f"Failed to download {url}: {e}")
 
 # -------------------------
-# Streamlit main UI
+# Streamlit main function
 # -------------------------
 def main():
     st.title("Scraping App for va.mite.gov.it")
-    st.write("Use the form below to search for *Progetti* or *Documenti* and optionally download them.")
-
-    # User input for the keyword
-    keyword = st.text_input("Insert the keyword to search", "")
-
-    # Choice for search type
+    st.write("Enter a keyword, select Progetti or Documenti, then press **Search**.")
+    
+    # Inputs
+    keyword = st.text_input("Keyword to search", "")
     search_type_map = {"Progetti (o)": "o", "Documenti (d)": "d"}
     search_type_choice = st.selectbox(
-        "Choose search type",
+        "Choose search type:",
         list(search_type_map.keys()),
         index=0
     )
     search_type = search_type_map[search_type_choice]
 
-    # "Search" button
+    # State to hold results
+    if "detail_urls" not in st.session_state:
+        st.session_state.detail_urls = []
+    if "results_info" not in st.session_state:
+        st.session_state.results_info = []  # Will store (detail_url, procedure_url, doc_links)
+
+    # Search button
     if st.button("Search"):
-        if not keyword:
+        if not keyword.strip():
             st.error("Please provide a keyword before searching.")
             return
 
+        # Clear previous results
+        st.session_state.detail_urls.clear()
+        st.session_state.results_info.clear()
+
+        # Set up folder
         safe_keyword = re.sub(r'[\\/*?:"<>|]', "_", keyword)
-        base_save_dir = os.path.join(DOWNLOAD_FOLDER, safe_keyword, "Progetti" if search_type == "o" else "Documenti")
+        search_type_full = "Progetti" if search_type == "o" else "Documenti"
+        base_save_dir = os.path.join(DOWNLOAD_FOLDER, safe_keyword, search_type_full)
         os.makedirs(base_save_dir, exist_ok=True)
 
+        # Step 1: Collect detail URLs
         with st.spinner("Collecting search results..."):
             detail_urls = collect_search_results(keyword, search_type=search_type)
-        st.success(f"Found {len(detail_urls)} detail URLs.")
+        st.success(f"Found {len(detail_urls)} detail URL(s).")
 
-        # Display the detail URLs
-        st.write("### Detail URLs:")
-        for u in detail_urls:
-            st.write(u)
+        # Save for next step
+        st.session_state.detail_urls = detail_urls
 
-        # Parse each detail URL for procedure links
-        st.write("---")
-        st.write("### Parsing each detail URL for procedure links & documents...")
+        # Step 2: Parse each detail URL for procedure links & doc links (but do not download yet)
         for detail_url in detail_urls:
             project_id = get_project_id(detail_url)
             project_folder = os.path.join(base_save_dir, project_id)
             os.makedirs(project_folder, exist_ok=True)
 
-            procedure_urls = get_procedura_links(detail_url, search_type=search_type)
-            st.write(f"**Detail URL:** {detail_url} — Found {len(procedure_urls)} procedure URLs")
-
+            procedure_urls = get_procedura_links(detail_url)
             for proc_url in procedure_urls:
                 doc_links = get_document_links(proc_url)
-                st.write(f"\n*Procedure URL:* {proc_url} — {len(doc_links)} document(s) found.")
-                if doc_links:
-                    with st.expander(f"Show documents for {proc_url}"):
-                        for (durl, nome_file) in doc_links:
-                            st.write(f"**File Name**: {nome_file} | **Download Link**: {durl}")
-                            # If you want to automatically download each file, call:
-                            # download_file(durl, nome_file, project_folder)
-                            # time.sleep(DELAY_BETWEEN_REQUESTS)
+                # Store these results so we can optionally download them
+                st.session_state.results_info.append(
+                    (detail_url, proc_url, doc_links, project_folder)
+                )
 
-                time.sleep(DELAY_BETWEEN_REQUESTS)  # to be polite
+        st.success("Parsing complete. Expand the results below or press 'Download All' to proceed.")
 
-            time.sleep(DELAY_BETWEEN_REQUESTS)  # polite delay
+    # Show the results of the search
+    if st.session_state.detail_urls:
+        st.write("---")
+        st.write("## Search Results Detail")
+        for (detail_url, proc_url, doc_links, folder) in st.session_state.results_info:
+            st.write(f"**Detail URL**: {detail_url}")
+            st.write(f"&emsp;**Procedure URL**: {proc_url}")
+            st.write(f"&emsp;Found **{len(doc_links)}** document(s).")
+            if doc_links:
+                with st.expander(f"Documents in {proc_url}"):
+                    for (durl, nome_file) in doc_links:
+                        st.write(f"- **File**: {nome_file}, **Link**: {durl}")
 
-        st.success("Scraping completed successfully!")
+    # Button to download all documents
+    if st.session_state.detail_urls:
+        if st.button("Download All"):
+            st.write("**Starting bulk download...** This may take a while.")
+            for (detail_url, proc_url, doc_links, project_folder) in st.session_state.results_info:
+                for (durl, nome_file) in doc_links:
+                    download_file(durl, nome_file, project_folder)
+                    time.sleep(DELAY_BETWEEN_REQUESTS)
+            st.success("All files have been downloaded.")
 
 if __name__ == "__main__":
     main()
